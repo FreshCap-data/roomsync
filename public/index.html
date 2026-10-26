@@ -90,18 +90,19 @@ function say(t, bad) { const m = $('#msg'); m.textContent = t; m.style.color = b
 async function start(role) {
   mode = role;
   try {
+    // Browsers only allow screen capture and audio start right after the click,
+    // so both are requested before the first await in this function.
+    const capturing = role === 'host' ? navigator.mediaDevices.getDisplayMedia({
+      video: { width: 1, height: 1, frameRate: 1 },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, suppressLocalAudioPlayback: true }
+    }) : null;
     ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: RATE });
-    await ctx.resume();
-    let stream;
-    if (role === 'host') {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: 1, height: 1, frameRate: 1 },
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, suppressLocalAudioPlayback: true }
-      });
-      if (!stream.getAudioTracks().length) {
-        stream.getTracks().forEach(t => t.stop());
-        return say('No audio was shared. In the picker, choose a tab or screen and tick "Share audio".', true);
-      }
+    const resumed = ctx.resume();
+    const stream = capturing ? await capturing : null;
+    await resumed;
+    if (stream && !stream.getAudioTracks().length) {
+      stream.getTracks().forEach(t => t.stop());
+      return say('No audio was shared. In the picker, choose a tab or screen and tick "Share audio".', true);
     }
     connect(role);
     if (role === 'host') await capture(stream);
