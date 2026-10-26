@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>RoomSync</title>
+<style>
+:root{--bg:#0e1116;--panel:#171c24;--line:#2a323f;--fg:#e6e9ee;--mut:#8d98a8;--ac:#ffb454;--ok:#7dd3a8;--bad:#ff7a7a}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:max(20px,env(safe-area-inset-top)) 20px 40px}
+main{max-width:520px;margin:0 auto}
+h1{font:700 28px/1.1 Georgia,'Times New Roman',serif;margin:8px 0 4px}
+p{color:var(--mut);margin:0 0 20px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+label{display:block;color:var(--mut);font-size:14px;margin:12px 0 4px}
+input[type=text]{width:100%;padding:10px 12px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:16px}
+input[type=range]{width:100%;accent-color:var(--ac)}
+.row{display:flex;gap:10px}
+button{flex:1;padding:12px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:16px;font-weight:600;cursor:pointer}
+button.main{background:var(--ac);color:#1a1205;border-color:var(--ac)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.big{font:700 56px/1 Georgia,serif;font-variant-numeric:tabular-nums;color:var(--ac)}
+.big small{font:16px system-ui;color:var(--mut)}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-variant-numeric:tabular-nums;font-size:14px;color:var(--mut)}
+.stats b{color:var(--fg);font-weight:600}
+#msg{min-height:22px;font-size:14px;color:var(--mut)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>RoomSync</h1>
+<p>Play one device's audio on every device in the room, in sync.</p>
+
+<div class="panel" id="setup">
+  <label for="room">Room name (anyone with this name can join)</label>
+  <input type="text" id="room" autocomplete="off" autocapitalize="off">
+  <div class="row" style="margin-top:14px">
+    <button class="main" id="bHost">Share this computer's audio</button>
+    <button id="bJoin">Listen on this device</button>
+  </div>
+  <div id="msg"></div>
+</div>
+
+<div class="panel" id="live" hidden>
+  <div class="big"><span id="vErr">0.0</span> <small>ms sync error</small></div>
+  <div class="stats" style="margin-top:12px">
+    <span>Role <b id="vRole"></b></span><span>Clock round trip <b id="vRtt">-</b></span>
+    <span>Clock samples <b id="vN">0</b></span><span>Late packets <b id="vLate">0</b></span>
+    <span>Shared delay <b id="vDelay">-</b></span><span>Packets <b id="vPk">0</b></span>
+  </div>
+  <div id="hostOnly" hidden>
+    <label for="delay">Shared delay: <b id="dv">150</b> ms (raise if packets arrive late)</label>
+    <input type="range" id="delay" min="20" max="600" value="150">
+    <label><input type="checkbox" id="loop"> Also play here (use when this computer's own speakers are muted by the capture)</label>
+  </div>
+  <label for="trim">This device's fine tune: <b id="tv">0</b> ms (move it if this speaker sounds early or late)</label>
+  <input type="range" id="trim" min="-150" max="150" step="0.5" value="0">
+</div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const FR = 960, RATE = 48000, HDR = 16, MS = FR / RATE * 1000; // 20 ms packets
+let ws, ctx, mode, off = 0, rtt = 0, samples = [], next = 0, trim = 0, delay = 150;
+const st = { late: 0, pk: 0, err: 0 };
+
+$('#room').value = location.hash.slice(1) || 'room-' + Math.random().toString(36).slice(2, 6);
+$('#trim').oninput = e => { trim = +e.target.value; $('#tv').textContent = trim; };
+$('#delay').oninput = e => { delay = +e.target.value; $('#dv').textContent = delay; };
+$('#bHost').onclick = () => start('host');
+$('#bJoin').onclick = () => start('listener');
+
+const WORKLET = `
+class Cap extends AudioWorkletProcessor{
+  constructor(){super();this.b=new Int16Array(${FR * 2});this.n=0}
+  process(inp){
+    const c=inp[0];if(!c||!c.length)return true;
+    const L=c[0],R=c[1]||c[0];
+    for(let k=0;k<L.length;k++){
+      this.b[this.n++]=Math.max(-1,Math.min(1,L[k]))*32767;
+      this.b[this.n++]=Math.max(-1,Math.min(1,R[k]))*32767;
+      if(this.n===this.b.length){this.port.postMessage(this.b.buffer,[this.b.buffer]);this.b=new Int16Array(${FR * 2});this.n=0}
+    }
+    return true}}
+registerProcessor('cap',Cap);`;
+
+function say(t, bad) { const m = $('#msg'); m.textContent = t; m.style.color = bad ? 'var(--bad)' : 'var(--mut)'; }
+
+async function start(role) {
+  mode = role;
+  try {
+    ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: RATE });
+    await ctx.resume();
+    let stream;
+    if (role === 'host') {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: 1, height: 1, frameRate: 1 },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, suppressLocalAudioPlayback: true }
+      });
+      if (!stream.getAudioTracks().length) {
+        stream.getTracks().forEach(t => t.stop());
+        return say('No audio was shared. In the picker, choose a tab or screen and tick "Share audio".', true);
+      }
+    }
+    connect(role);
+    if (role === 'host') await capture(stream);
+    $('#setup').hidden = true; $('#live').hidden = false;
+    $('#vRole').textContent = role === 'host' ? 'Host' : 'Listener';
+    $('#hostOnly').hidden = role !== 'host';
+    try { await navigator.wakeLock.request('screen'); } catch {}
+    setInterval(stats, 250);
+  } catch (e) { say(e.message || String(e), true); }
+}
+
+function connect(role) {
+  const room = $('#room').value.trim().replace(/[^\w-]/g, '') || 'room';
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${room}?role=${role}`);
+  ws.binaryType = 'arraybuffer';
+  let n = 0;
+  const tick = () => { if (ws.readyState !== 1) return; ws.send(JSON.stringify({ t: 'p', c: performance.now() })); setTimeout(tick, ++n < 30 ? 100 : 2000); };
+  ws.onopen = tick;
+  ws.onclose = () => say('Disconnected. Reload to rejoin.', true);
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') return pong(JSON.parse(e.data));
+    play(e.data);
+  };
+}
+
+// Clock sync against the Worker's clock: keep the lowest-RTT samples, average them.
+function pong(j) {
+  const now = performance.now(), r = now - j.c;
+  samples.push({ r, o: j.s + r / 2 - now });
+  if (samples.length > 40) samples.shift();
+  const best = [...samples].sort((a, b) => a.r - b.r).slice(0, 8);
+  off = best.reduce((a, b) => a + b.o, 0) / best.length;
+  rtt = best[0].r;
+}
+
+async function capture(stream) {
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' })));
+  const src = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+  const node = new AudioWorkletNode(ctx, 'cap', { numberOfOutputs: 1, outputChannelCount: [1] });
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(node); node.connect(mute).connect(ctx.destination);
+  let seq = 0, stamp = 0;
+  node.port.onmessage = e => {
+    if (samples.length < 10 || ws.readyState !== 1) { stamp = 0; return; }
+    const measured = performance.now() + off - MS;            // server-clock time this packet began
+    stamp = stamp ? stamp + MS + 0.002 * (measured - (stamp + MS)) : measured; // smooth jitter, follow drift
+    const b = new ArrayBuffer(HDR + e.data.byteLength), dv = new DataView(b);
+    dv.setFloat64(0, stamp, true); dv.setUint32(8, seq++, true); dv.setUint16(12, delay, true);
+    new Uint8Array(b, HDR).set(new Uint8Array(e.data));
+    if (ws.bufferedAmount < 1e6) ws.send(b);
+    if ($('#loop').checked) play(b);
+  };
+}
+
+// Schedule each packet at its shared timestamp + shared delay, on this device's audio clock.
+function play(buf) {
+  if (!ctx || ctx.state !== 'running') return;
+  const dv = new DataView(buf), stamp = dv.getFloat64(0, true);
+  delay = dv.getUint16(12, true);
+  const s = new Int16Array(buf, HDR), N = s.length / 2;
+  const ab = ctx.createBuffer(2, N, RATE), L = ab.getChannelData(0), R = ab.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = s[2 * i] / 32768; R[i] = s[2 * i + 1] / 32768; }
+  const pt = stamp - off + delay + trim;                       // local performance.now() when it should be heard
+  const ts = ctx.getOutputTimestamp();
+  const T = ts.performanceTime > 0
+    ? ts.contextTime + (pt - ts.performanceTime) / 1000
+    : ctx.currentTime + (pt - performance.now()) / 1000 - (ctx.outputLatency || ctx.baseLatency || 0);
+  const now = ctx.currentTime;
+  if (T < now + 0.002) { st.late++; return; }
+  let start = next, rate = 1;
+  if (next < now || Math.abs(T - next) > 0.02) start = T;      // hard resync
+  else rate = 1 - Math.max(-0.005, Math.min(0.005, 2 * (T - next))); // gentle drift correction
+  const node = ctx.createBufferSource();
+  node.buffer = ab; node.playbackRate.value = rate; node.connect(ctx.destination); node.start(start);
+  next = start + N / RATE / rate;
+  st.err = (T - start) * 1000; st.pk++;
+}
+
+function stats() {
+  $('#vErr').textContent = Math.abs(st.err).toFixed(1);
+  $('#vRtt').textContent = rtt ? rtt.toFixed(1) + ' ms' : '-';
+  $('#vN').textContent = samples.length;
+  $('#vLate').textContent = st.late;
+  $('#vPk').textContent = st.pk;
+  $('#vDelay').textContent = delay + ' ms';
+  $('#dv').textContent = delay;
+}
+</script>
+</body>
+</html>

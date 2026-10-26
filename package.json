@@ -1,0 +1,14 @@
+{
+  "name": "roomsync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8799",
+    "deploy": "wrangler deploy",
+    "test:sim": "node test/sim.test.mjs",
+    "test:relay": "node test/relay.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
